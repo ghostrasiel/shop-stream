@@ -1,0 +1,177 @@
+[
+  {
+    "sku": "ELEC-HEAD-100",
+    "name": "Aural Cloud Headphones",
+    "category": "electronics",
+    "brand": "Aural",
+    "price": 129.0,
+    "currency": "USD",
+    "attributes": {
+      "wireless": true,
+      "battery_hours": 30,
+      "warranty_months": 24,
+      "weight_g": 254,
+      "dimensions_mm": {"w": 170, "h": 190, "d": 80}
+    }
+  },
+  {
+    "sku": "ELEC-KEYB-110",
+    "name": "Keylight Mechanical Keyboard",
+    "category": "electronics",
+    "brand": "Keylight",
+    "price": 89.0,
+    "currency": "USD",
+    "attributes": {
+      "switch": "tactile",
+      "layout": "tkl",
+      "backlight": true,
+      "warranty_months": 12,
+      "connection": ["usb-c", "bluetooth"]
+    }
+  },
+  {
+    "sku": "ELEC-MOUS-120",
+    "name": "Drift Wireless Mouse",
+    "category": "electronics",
+    "brand": "Drift",
+    "price": 49.0,
+    "currency": "USD",
+    "attributes": {
+      "dpi": 3200,
+      "wireless": true,
+      "battery_hours": 70,
+      "buttons": 6
+    }
+  },
+  {
+    "sku": "APPR-CREW-200",
+    "name": "Northloom Merino Crewneck",
+    "category": "apparel",
+    "brand": "Northloom",
+    "price": 68.0,
+    "currency": "USD",
+    "attributes": {
+      "sizes": ["XS", "S", "M", "L", "XL"],
+      "colors": ["navy", "oat"],
+      "material": "merino wool",
+      "gender": "unisex",
+      "care": "hand wash"
+    }
+  },
+  {
+    "sku": "APPR-PANT-210",
+    "name": "Harbor Work Pant",
+    "category": "apparel",
+    "brand": "Harbor",
+    "price": 92.0,
+    "currency": "USD",
+    "attributes": {
+      "sizes": ["28", "30", "32", "34", "36"],
+      "colors": ["ink", "sand"],
+      "material": "cotton canvas",
+      "fit": "straight",
+      "pockets": 5
+    }
+  },
+  {
+    "sku": "APPR-CAP-220",
+    "name": "Field Canvas Cap",
+    "category": "apparel",
+    "brand": "Field",
+    "price": 28.0,
+    "currency": "USD",
+    "attributes": {
+      "sizes": ["S/M", "L/XL"],
+      "colors": ["olive", "black"],
+      "material": "canvas",
+      "adjustable": true
+    }
+  },
+  {
+    "sku": "GROC-COFF-300",
+    "name": "Harbor Roast Huila Beans",
+    "category": "grocery",
+    "brand": "Harbor Roast",
+    "price": 16.5,
+    "currency": "USD",
+    "attributes": {
+      "weight_g": 340,
+      "origin": "Huila, Colombia",
+      "organic": true,
+      "roast": "medium",
+      "shelf_life_days": 180
+    }
+  },
+  {
+    "sku": "GROC-TEA-310",
+    "name": "Cedar Sencha",
+    "category": "grocery",
+    "brand": "Cedar",
+    "price": 12.0,
+    "currency": "USD",
+    "attributes": {
+      "weight_g": 80,
+      "origin": "Shizuoka, Japan",
+      "organic": false,
+      "caffeine": "green tea",
+      "shelf_life_days": 365
+    }
+  },
+  {
+    "sku": "GROC-OATS-320",
+    "name": "Kiln Rolled Oats",
+    "category": "grocery",
+    "brand": "Kiln",
+    "price": 6.5,
+    "currency": "USD",
+    "attributes": {
+      "weight_g": 500,
+      "organic": true,
+      "gluten_free": false,
+      "shelf_life_days": 270
+    }
+  },
+  {
+    "sku": "BEAU-LIPS-400",
+    "name": "Satin Rose Lip Tint",
+    "category": "beauty",
+    "brand": "Satin",
+    "price": 22.0,
+    "currency": "USD",
+    "attributes": {
+      "shade": "rose",
+      "volume_ml": 6,
+      "finish": "satin",
+      "vegan": true
+    }
+  },
+  {
+    "sku": "BEAU-SERUM-410",
+    "name": "Night Repair Serum",
+    "category": "beauty",
+    "brand": "Lumen",
+    "price": 54.0,
+    "currency": "USD",
+    "attributes": {
+      "volume_ml": 30,
+      "actives": ["niacinamide", "peptide"],
+      "fragrance_free": true,
+      "skin_type": ["dry", "normal"]
+    }
+  },
+  {
+    "sku": "BEAU-SPF-420",
+    "name": "Mineral Daily SPF",
+    "category": "beauty",
+    "brand": "Lumen",
+    "price": 26.0,
+    "currency": "USD",
+    "attributes": {
+      "spf": 30,
+      "volume_ml": 50,
+      "filters": ["zinc oxide"],
+      "finish": "natural",
+      "water_resistant": false
+    }
+  }
+]

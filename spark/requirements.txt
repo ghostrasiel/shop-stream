@@ -1,0 +1,3 @@
+# Spark image is Python 3.8. Keep these pins on the 3.8-compatible line.
+psycopg[binary]==3.2.9
+pymongo==4.10.1

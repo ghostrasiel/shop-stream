@@ -196,6 +196,45 @@ printjson(db.events_dlq.findOne({}, { _id: 0 }));
 '
 
 echo
+echo "=== Prometheus targets ==="
+prom_port="${PROMETHEUS_PORT:-9090}"
+prom_ok=0
+prom_deadline=$((SECONDS + 120))
+while (( SECONDS < prom_deadline )); do
+  if curl -fsS "http://localhost:${prom_port}/api/v1/targets" -o /tmp/shop-prom-targets.json; then
+    if python3 - <<'PY'
+import json
+import sys
+data = json.load(open("/tmp/shop-prom-targets.json"))
+need = {"prometheus", "spark", "generator", "kafka-exporter", "lag-exporter", "postgres"}
+up = set()
+for target in data["data"]["activeTargets"]:
+    if target.get("health") == "up":
+        up.add(target.get("labels", {}).get("job"))
+missing = sorted(need - up)
+print("up=" + ",".join(sorted(up)))
+if missing:
+    print("missing=" + ",".join(missing))
+    sys.exit(1)
+PY
+    then
+      prom_ok=1
+      break
+    fi
+  fi
+  echo "waiting for prometheus targets"
+  sleep 5
+done
+if [[ "$prom_ok" -ne 1 ]]; then
+  echo "prometheus targets are not all up" >&2
+  exit 1
+fi
+
+echo
+echo "=== dbt build, test, freshness, docs ==="
+compose --profile dbt run --rm --build dbt
+
+echo
 echo "=== idempotent upsert probe ==="
 pg_exec "INSERT INTO events (event_id, event_type, event_time, user_id, session_id, kafka_partition, kafka_offset)
 VALUES ('idem-probe', 'page_view', now(), 'probe', 'probe', 0, -1)

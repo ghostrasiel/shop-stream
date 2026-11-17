@@ -180,6 +180,9 @@ services:
       LATE_EVENT_RATE: ${LATE_EVENT_RATE:-0.05}
       LATE_EVENT_LAG_SECONDS: ${LATE_EVENT_LAG_SECONDS:-180}
       CATALOG_PATH: /app/catalog/products.json
+      METRICS_PORT: "9096"
+    ports:
+      - "${GENERATOR_METRICS_PORT:-9096}:9096"
     restart: unless-stopped
     mem_limit: 256m
     logging: *logging
@@ -218,6 +221,7 @@ services:
       PYSPARK_PYTHON: python3
       PYSPARK_DRIVER_PYTHON: python3
       PYTHONPATH: /opt/job
+      METRICS_PORT: "9095"
     command:
       - --master
       - local[2]
@@ -236,6 +240,7 @@ services:
       - /opt/job/main.py
     ports:
       - "${SPARK_UI_PORT:-4040}:4040"
+      - "${SPARK_METRICS_PORT:-9095}:9095"
     volumes:
       - spark-checkpoints:/checkpoints
     mem_limit: 2048m
@@ -260,8 +265,107 @@ services:
     restart: unless-stopped
     logging: *logging
 
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.8.0
+    command: ["--kafka.server=kafka:19092"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "${KAFKA_EXPORTER_PORT:-9308}:9308"
+    mem_limit: 128m
+    restart: unless-stopped
+    logging: *logging
+
+  lag-exporter:
+    build:
+      context: ./observability/lag_exporter
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:19092}
+      TOPIC: ${TOPIC:-shop.events}
+      CHECKPOINT_ROOT: /checkpoints
+      METRICS_PORT: "9097"
+    volumes:
+      - spark-checkpoints:/checkpoints:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "${LAG_EXPORTER_PORT:-9097}:9097"
+    mem_limit: 192m
+    restart: unless-stopped
+    logging: *logging
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.16.0
+    environment:
+      DATA_SOURCE_NAME: postgresql://${POSTGRES_USER:-shop}:${POSTGRES_PASSWORD:-shop}@postgres:5432/${POSTGRES_DB:-shop}?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${POSTGRES_EXPORTER_PORT:-9187}:9187"
+    mem_limit: 64m
+    restart: unless-stopped
+    logging: *logging
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=6h
+      - --web.enable-lifecycle
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    mem_limit: 512m
+    restart: unless-stopped
+    logging: *logging
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_DEFAULT_THEME: light
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      - prometheus
+    mem_limit: 384m
+    restart: unless-stopped
+    logging: *logging
+
+  dbt:
+    profiles: ["dbt"]
+    build:
+      context: ./dbt
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-shop}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-shop}
+      POSTGRES_DB: ${POSTGRES_DB:-shop}
+      DBT_PROFILES_DIR: /usr/app
+    volumes:
+      - ./dbt:/usr/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    mem_limit: 768m
+    logging: *logging
+
 volumes:
   kafka-data:
   postgres-data:
   mongo-data:
   spark-checkpoints:
+  prometheus-data:

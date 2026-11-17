@@ -1,0 +1,24 @@
+groups:
+  - name: shop-stream
+    rules:
+      # Fires after Spark is stopped and the generator keeps writing, because
+      # shop_spark_checkpoint_lag_records is scraped from lag-exporter, not
+      # from the driver. 100 records is about 20s at the default 5 events/s.
+      - alert: ShopSparkLagHigh
+        expr: sum(shop_spark_checkpoint_lag_records) > 100
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Spark checkpoint lag is above 100 records
+          description: Checkpoint resume offsets are behind the Kafka end offset. The driver is stopped or the queries are not keeping up.
+      # Default BAD_EVENT_RATE is 0.02 of 5 events/s, about 0.1/s, so this
+      # stays inactive until bad traffic is an order of magnitude higher.
+      - alert: ShopDlqRateHigh
+        expr: sum(rate(shop_dlq_events_total[2m])) > 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: DLQ rate is above 1 event/s
+          description: Invalid records are landing on the DLQ faster than the demo fault rate.

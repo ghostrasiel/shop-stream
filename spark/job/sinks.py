@@ -22,6 +22,7 @@ import psycopg
 from pymongo import MongoClient, ReplaceOne, UpdateOne
 
 from config import Config
+from metrics_server import METRICS
 from rows import dedupe_last_offset
 from validate import error_class, parse_event_time
 
@@ -289,6 +290,8 @@ def _write_mongo_raw(cfg: Config, rows: list) -> None:
 def _write_dlq(spark, cfg: Config, rows: list) -> None:
     now = datetime.now(timezone.utc)
     docs = [_dlq_doc(row, now) for row in rows]
+    for doc in docs:
+        METRICS.inc("shop_dlq_events_total", error_class=doc["error_class"])
     client = MongoClient(cfg.mongo_uri, serverSelectionTimeoutMS=5000)
     try:
         ops = [

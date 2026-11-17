@@ -2,7 +2,7 @@
 
 本機的電商 event pipeline。一條指令拉起 Kafka（KRaft）、Schema Registry、一支 Python producer、Spark Structured Streaming、PostgreSQL 和 MongoDB。Event 會 upsert 進有型別的 table，也會寫進一份 raw document collection。
 
-Milestone 1 是 ingest path。Milestone 2 加上正確性：event-time watermark、依 natural key 的 idempotent upsert、session window、1 分鐘 tumbling GMV、dead-letter。Prometheus、Grafana、dbt、BigQuery 還在後面。可以在筆電上跑，也可以順著講。
+Milestone 1 是 ingest path。Milestone 2 加上正確性：event-time watermark、依 natural key 的 idempotent upsert、session window、1 分鐘 tumbling GMV、dead-letter。Milestone 3 加上 Prometheus、Grafana，以及在 Postgres 上的 dbt batch layer，用來對帳 streaming GMV。BigQuery 和 load test 還在後面。可以在筆電上跑，也可以順著講。
 
 ## Architecture
 
@@ -16,6 +16,9 @@ flowchart LR
   Mongo[("MongoDB<br/>events_raw + products<br/>+ events_dlq")]
   DLQ["shop.events.dlq"]
   UI["Kafka UI :8080"]
+  Prom["Prometheus"]
+  Graf["Grafana :3000"]
+  Dbt["dbt batch layer"]
 
   Gen -->|register shop.events-value| SR
   Gen -->|"valid JSON, bad frames, late event_time"| Kafka
@@ -24,6 +27,10 @@ flowchart LR
   Spark -->|raw payload| Mongo
   Spark -->|invalid records| DLQ
   DLQ --> Mongo
+  Spark -->|"/metrics progress"| Prom
+  Gen -->|produced / sec| Prom
+  Prom --> Graf
+  Dbt -->|rebuild GMV from payments| PG
   Seed["Catalog seed"] -->|heterogeneous attributes| Mongo
   UI --> Kafka
   UI --> SR
@@ -38,11 +45,13 @@ Generator 仍會編 `session_id`，那只是 producer 圖方便。Session window
 | Event generator | 走一個很小的 per-user state machine：page view、add to cart、order、payment。把 device 和 UTM 黏在同一個 session 上。先註冊 JSON Schema，再以 key `user_id` produce 到 `shop.events`。速率是 `EVENTS_PER_SECOND`。另外依 `BAD_EVENT_RATE` 塞不合法的 bytes，依 `LATE_EVENT_RATE` 把 `event_time` 往回撥。 |
 | Kafka | 一台 combined KRaft broker。沒有 ZooKeeper。`kafka/create-topics.sh` 建立 `shop.events` 和 `shop.events.dlq`（各 3 partitions、RF 1、retention 24 小時）。Auto-create 關掉，避免打錯字多生出一個 1-partition topic。 |
 | Schema Registry | 把契約放在 subject `shop.events-value`（TopicNameStrategy）。Registry 沒起來，producer 就拒絕啟動，對不上 schema 的 payload 不會進 topic。 |
-| Spark | 三條 query，各有自己的 checkpoint。Facts 剝掉 5-byte Confluent prefix、驗證契約、upsert 合法的 row，並把不合法的送去 DLQ。Session 和 GMV 兩條 query 在 `event_time` 上加 watermark，用 update mode 把 window 寫進 Postgres。 |
+| Spark | 三條 query，各有自己的 checkpoint。Facts 做 upsert 和 DLQ。Session window 用 append mode（watermark 越過 session end 才寫出）。GMV tumbling window 用 update mode。Driver 上的 `StreamingQueryListener` 把 throughput、batch duration、watermark drop、state rows 打到 `:9095/metrics`。 |
 | PostgreSQL | 有型別的 fact table（events、orders、order items、payments），加上 `session_metrics` 和 `gmv_1m`。初始化 SQL 在 `postgres/init/`。 |
 | MongoDB | `events_raw` 留著巢狀 payload，以 `event_id` unique upsert。`events_dlq` 以 source offset unique upsert。`products` 是一份 catalog，`attributes` 物件的形狀依 category 而變。 |
 | Kafka UI | 在 `http://localhost:8080` 瀏覽 topic 和已註冊的 schema。不在資料路徑上。 |
 | Spark UI | Query 在跑的時候開 `http://localhost:4040`。 |
+| Prometheus / Grafana | Prometheus 刮 Spark、generator、lag exporter、kafka-exporter、postgres-exporter。Grafana 開機就載入 dashboard，不用手動 import。帳號 `admin` / `admin`，匿名也可以看。 |
+| dbt | `make dbt` 在 Postgres 上跑 staging → intermediate → marts，並對 `gmv_1m` 和從 `payments` 重算的 GMV 做 reconciliation。 |
 
 ## 怎麼跑
 
@@ -50,7 +59,7 @@ Generator 仍會編 `session_id`，那只是 producer 圖方便。Session window
 
 ```bash
 make up      # copies .env.example if needed, builds, starts detached
-make check   # waits until both sinks have rows, then prints counts
+make check   # data, prometheus targets, dbt, then the Spark kill test
 make logs    # follow everything
 make down    # stop, keep volumes
 make reset   # stop and delete volumes
@@ -58,7 +67,7 @@ make reset   # stop and delete volumes
 
 `docker compose up --build` 做同樣的啟動，只是跑在前景。預設值寫在 `docker-compose.yml`，沒有 `.env` 也沒關係。要改速率、port 或本機資料庫密碼，編輯 `.env`（對照 `.env.example`）。這組密碼只給筆電本機用。
 
-`make check` 會等到 facts、`session_metrics`、`gmv_1m`、late events 和 Mongo `events_dlq` 都有資料，檢查 natural key 沒有重複，然後停掉 generator、對 Spark 送 `SIGKILL`，再確認那些 count 沒有變。第一次啟動請多等幾分鐘：Spark 要先起來，然後一個 5 秒的 trigger 才會把 batch 寫下去。Check 結束會把 generator 拉回來。
+`make check` 會等到 facts、`session_metrics`、`gmv_1m`、late events 和 Mongo `events_dlq` 都有資料，確認 Prometheus target 都是 up、dbt test 通過，再停掉 generator、對 Spark 送 `SIGKILL`，確認那些 count 沒有變。第一次啟動請多等幾分鐘：Spark 要先起來，然後一個 5 秒的 trigger 才會把 batch 寫下去。Check 結束會把 generator 拉回來。
 
 常用的旋鈕：
 
@@ -77,7 +86,21 @@ make reset   # stop and delete volumes
 
 Host 上的 port：Kafka `9092`、Schema Registry `8081`、Postgres `5432`、Mongo `27017`、Kafka UI `8080`、Spark UI `4040`。
 
-`make down && make up` 會接著跑。Kafka log、Postgres、Mongo 和 Spark checkpoint 都是 volume，所以 offset 和 row 在重啟之後還在。`make reset` 會把這四份一起清掉。不要只刪 Kafka 或只刪 checkpoint：checkpoint 會指到新 broker 上不存在的 offset（`failOnDataLoss` 是 false，所以 query 會繼續，但你已經跳過一段資料）。
+`make down && make up` 會接著跑。Kafka log、Postgres、Mongo、Spark checkpoint 和 Prometheus 都是 named volume，所以 offset 和 row 在重啟之後還在。`make reset` 是 `docker compose down -v`，會刪掉這個 compose file 裡的每一個 named volume，包含 Kafka、Postgres、Mongo、Spark checkpoint、Prometheus。`make down` 只停容器，資料還在。不要只刪 Kafka 或只刪 checkpoint：checkpoint 會指到新 broker 上不存在的 offset（`failOnDataLoss` 是 false，所以 query 會繼續，但你已經跳過一段資料）。
+
+看 dashboard：
+
+```bash
+make dashboards
+```
+
+Grafana 是 `http://localhost:3000`，帳號 `admin` / `admin`。匿名 Viewer 也開著，所以 `make up` 之後不用點 import。Prometheus 的 alert 在 `http://localhost:9090/alerts`。沒有 Alertmanager。
+
+跑 batch layer：
+
+```bash
+make dbt
+```
 
 改完 `catalog/products.json` 之後重新灌 products：
 
@@ -237,6 +260,38 @@ Kafka 的讀取、JSON parse 和 window aggregation 留在 streaming plan 裡，
 
 Spark 在一個 container 裡跑 `local[2]`。沒有 cluster，也沒有 Kubernetes。
 
+## Observability
+
+Structured Streaming 預設不 commit consumer group，所以 `kafka-exporter` 看不到 Spark 的 lag。它仍然在 stack 裡，用來說明「group lag 這條路對這個 job 是空的」。真正的 lag 是 `lag-exporter`：它讀 checkpoint 裡已 commit 的 resume offset，減去 Kafka end offset。Driver 停掉以後 checkpoint 凍結、generator 繼續寫，這個 gauge 還在被 Prometheus 刮，所以可以把 Spark `stop` 掉來觸發 `ShopSparkLagHigh`（總 lag > 100，持續 2 分鐘）。`ShopDlqRateHigh` 是 DLQ 超過 1 event/s 持續 2 分鐘；預設 `BAD_EVENT_RATE=0.02` 大約 0.1 event/s，規則會載入但不會響。
+
+Dashboard `shop-stream` 的面板：
+
+| 面板 | 在看什麼 |
+| --- | --- |
+| Throughput in vs processed | 每條 query 的 `inputRowsPerSecond` 和 `processedRowsPerSecond`。in 長期高於 processed，代表跟不上。 |
+| Generator produced / sec | `on_time`、`late`、`bad` 三種產出。late 是合法但 `event_time` 被往回撥的；bad 會進 DLQ。 |
+| Spark checkpoint lag | 每條 query 落後 Kafka end offset 的筆數。Spark 停著的時候這條線會爬升。 |
+| Batch duration | 上一個 micro-batch 的 `triggerExecution` 毫秒數。 |
+| Rows dropped by watermark | session / GMV state 丟掉的 late row。Fact table 仍保留那些 payment。 |
+| State rows | window state 裡還留著幾列。 |
+| DLQ by category | `invalid_frame`、`unparseable`、`schema_violation` 的速率。 |
+
+要在 Grafana 看 late data：看「Rows dropped by watermark」。session 和 GMV query 會增加；`shop-facts` 通常是 0，因為 fact sink 沒有 watermark。同一段時間 generator 的 `late` 系列仍在增加，Postgres 的 `payments` 也還有那些列。這就是 speed layer 少算、batch layer 補得回來的那一段。
+
+## dbt：batch layer 和 reconciliation
+
+`make dbt` 跑 `dbt build`、`dbt source freshness`、`dbt docs generate`。分層是 staging（view）→ intermediate（view）→ marts（table），schema 分別是 `staging`、`intermediate`、`marts`。
+
+- `fct_gmv_1m` 用 `payments.event_time` 重切 1 分鐘，**包含** late payment。
+- `fct_gmv_daily` 是上面的日彙總。
+- `fct_orders` 是 orders fact。
+- `fct_funnel_daily` 是一天裡四種 event 的筆數。
+- `recon_gmv_1m` 把 batch GMV 和 streaming `gmv_1m` 放在同一分鐘，`gmv_diff = batch - streaming`，`late_gmv` 是 `event_time` 比 `ingested_at` 早超過 2 分鐘的金額。
+
+Custom test 要求 `0 <= gmv_diff <= late_gmv`（容許 0.01）。Streaming 少算的部分必須被 late payment 解釋；streaming 比 batch 多，測試會失敗。頭幾個 micro-batch 還沒有 watermark，所以有些 late payment 仍會進 `gmv_1m`，diff 會小於 `late_gmv`，測試允許這個情況。
+
+這是 lambda 的 speed layer 對 batch layer：streaming GMV 為了有界的 state 和確定的 window 會少算；batch 從 `payments` 重算，把 watermark 丟掉的錢補回來。面試時可以講：不要用 consumer-group lag 描述一個不 commit group 的 Structured Streaming job；reconciliation 的 diff 要能指回 late data，而不是只剩一個對不上的數字。
+
 ## 還沒做的事
 
-Prometheus、Grafana、dbt、load test、BigQuery。沒有 Kubernetes。
+Load test、BigQuery。沒有 Kubernetes，也沒有 Alertmanager。

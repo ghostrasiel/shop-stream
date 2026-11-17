@@ -1,26 +1,32 @@
-"""Kafka binary value -> one flat row per event.
+"""Kafka binary value -> one flat row per event, plus a reject reason.
 
-Parsing stays in the streaming plan so the Spark UI shows it. Writes do not:
-foreachBatch is the M2 extension point (upsert, dead-letter, watermark are
-not applied here).
+Parsing stays in the streaming plan. The fact sink, the session window, and
+the GMV window each read the topic on their own query; call this once per
+source. Watermarks are not applied here. A fact row that is merely late is
+still a fact. Window queries put the watermark on their own aggregation.
 """
 
 from __future__ import annotations
 
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
+from pyspark.sql.types import StringType
 
 from schema import EVENT_SCHEMA, FRAME_SCHEMA
+from validate import reject_reason
 from wire import decode_confluent_wire
 
 
 def parse_stream(kafka_df: DataFrame) -> DataFrame:
     decode = F.udf(decode_confluent_wire, FRAME_SCHEMA)
+    classify = F.udf(reject_reason, StringType())
     framed = kafka_df.select(
         F.col("topic"),
         F.col("partition"),
         F.col("offset"),
         F.col("key").cast("string").alias("message_key"),
+        # Kept for the DLQ when the frame itself is not JSON.
+        F.substring(F.col("value").cast("string"), 1, 200).alias("raw_preview"),
         decode(F.col("value")).alias("frame"),
     )
     decoded = framed.select(
@@ -28,6 +34,7 @@ def parse_stream(kafka_df: DataFrame) -> DataFrame:
         "partition",
         "offset",
         "message_key",
+        "raw_preview",
         F.col("frame.schema_id").alias("schema_id"),
         F.col("frame.json_payload").alias("raw_json"),
     )
@@ -35,10 +42,11 @@ def parse_stream(kafka_df: DataFrame) -> DataFrame:
         "event",
         F.from_json(F.col("raw_json"), EVENT_SCHEMA, {"mode": "PERMISSIVE"}),
     )
-    # M2: parsed.withWatermark("event_time", "10 minutes") and
-    # dropDuplicates(["event_id"]) belong here, once event_time is a timestamp
-    # and the sink upserts by event_id. Left out so M1 is a straight ingest.
-    return _flatten(parsed)
+    flat = _flatten(parsed)
+    return flat.withColumn(
+        "reject_reason",
+        classify(F.col("raw_json").isNotNull(), F.col("raw_json")),
+    )
 
 
 def _flatten(parsed: DataFrame) -> DataFrame:
@@ -52,10 +60,16 @@ def _flatten(parsed: DataFrame) -> DataFrame:
         event.getField("event_type") == F.lit("order_created"),
         F.size(payload.getField("order").getField("items")),
     ).cast("int")
+    # Strip the trailing Z and parse as UTC. The session timezone is UTC.
+    event_ts = F.to_timestamp(
+        F.regexp_replace(event.getField("event_time"), "Z$", ""),
+        "yyyy-MM-dd'T'HH:mm:ss.SSS",
+    )
     return parsed.select(
         event.getField("event_id").alias("event_id"),
         event.getField("event_type").alias("event_type"),
         event.getField("event_time").alias("event_time"),
+        event_ts.alias("event_ts"),
         event.getField("user_id").alias("user_id"),
         event.getField("session_id").alias("session_id"),
         payload.getField("device").getField("type").alias("device_type"),
@@ -77,6 +91,7 @@ def _flatten(parsed: DataFrame) -> DataFrame:
         payload.getField("payment").getField("status").alias("payment_status"),
         F.col("schema_id"),
         F.col("raw_json"),
+        F.col("raw_preview"),
         F.col("topic"),
         F.col("partition"),
         F.col("offset"),

@@ -12,6 +12,7 @@ import random
 import signal
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from confluent_kafka import Producer
@@ -20,6 +21,7 @@ from confluent_kafka.schema_registry.json_schema import JSONSerializer
 from confluent_kafka.serialization import MessageField, SerializationContext
 
 from catalog_data import load_catalog
+from faults import BAD_KINDS, bad_event_bytes, late_event_time, with_event_time
 from simulator import ShopSimulator
 
 log = logging.getLogger("generator")
@@ -73,6 +75,13 @@ def main() -> None:
         raise SystemExit("EVENTS_PER_SECOND must be > 0")
     seed_raw = os.environ.get("SIM_SEED", "")
     rng_seed = int(seed_raw) if seed_raw else None
+    bad_rate = float(_env("BAD_EVENT_RATE", "0.02"))
+    late_rate = float(_env("LATE_EVENT_RATE", "0.05"))
+    late_lag = int(_env("LATE_EVENT_LAG_SECONDS", "180"))
+    if bad_rate < 0 or late_rate < 0 or bad_rate + late_rate >= 1:
+        raise SystemExit("BAD_EVENT_RATE and LATE_EVENT_RATE must be >= 0 and sum to < 1")
+    if late_lag <= 0:
+        raise SystemExit("LATE_EVENT_LAG_SECONDS must be > 0")
 
     schema_str = SCHEMA_PATH.read_text(encoding="utf-8")
     _wait_until_ready(bootstrap, schema_registry_url, topic)
@@ -97,7 +106,7 @@ def main() -> None:
             "bootstrap.servers": bootstrap,
             "client.id": "shop-event-generator",
             # Producer idempotence only. A retried produce does not append the
-            # record twice. Sink writes are still at-least-once; M2 fixes that.
+            # record twice. Sink replays are absorbed by the upserts.
             "enable.idempotence": True,
             "acks": "all",
             "max.in.flight.requests.per.connection": 5,
@@ -133,27 +142,49 @@ def main() -> None:
             log.error("delivery failed: %s", err)
 
     produced = 0
+    bad_produced = 0
+    late_produced = 0
     by_type: dict[str, int] = {}
     interval = 1.0 / rate
     next_at = time.monotonic()
     last_report = time.monotonic()
     log.info(
-        "producing topic=%s key=user_id rate=%s/s schema_id=%s",
+        "producing topic=%s key=user_id rate=%s/s schema_id=%s bad_rate=%s late_rate=%s late_lag_s=%s",
         topic,
         rate,
         schema_id,
+        bad_rate,
+        late_rate,
+        late_lag,
     )
 
     while not stop:
-        event = simulator.next_event()
-        payload = serializer(event, context)
+        roll = random.random()
+        if roll < bad_rate:
+            kind = BAD_KINDS[bad_produced % len(BAD_KINDS)]
+            payload = bad_event_bytes(kind)
+            key = b"bad"
+            headers = [("fault", kind.encode("utf-8"))]
+            event_type_name = "invalid"
+            bad_produced += 1
+        else:
+            event = simulator.next_event()
+            if roll < bad_rate + late_rate:
+                event = with_event_time(event, late_event_time(datetime.now(timezone.utc), late_lag))
+                late_produced += 1
+                headers = [("event_type", event["event_type"].encode("utf-8")), ("fault", b"late")]
+            else:
+                headers = [("event_type", event["event_type"].encode("utf-8"))]
+            payload = serializer(event, context)
+            key = event["user_id"].encode("utf-8")
+            event_type_name = event["event_type"]
         while not stop:
             try:
                 producer.produce(
                     topic=topic,
-                    key=event["user_id"].encode("utf-8"),
+                    key=key,
                     value=payload,
-                    headers=[("event_type", event["event_type"].encode("utf-8"))],
+                    headers=headers,
                     on_delivery=_on_delivery,
                 )
                 break
@@ -163,13 +194,20 @@ def main() -> None:
             break
         producer.poll(0)
         produced += 1
-        by_type[event["event_type"]] = by_type.get(event["event_type"], 0) + 1
+        by_type[event_type_name] = by_type.get(event_type_name, 0) + 1
 
         now = time.monotonic()
         if now - last_report >= 10:
             with error_lock:
                 failed = errors
-            log.info("produced=%s errors=%s by_type=%s", produced, failed, by_type)
+            log.info(
+                "produced=%s bad=%s late=%s errors=%s by_type=%s",
+                produced,
+                bad_produced,
+                late_produced,
+                failed,
+                by_type,
+            )
             last_report = now
 
         next_at += interval

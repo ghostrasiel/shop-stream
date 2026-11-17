@@ -135,6 +135,7 @@ services:
       KAFKA_HEAP_OPTS: "-Xms64M -Xmx256M"
       KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:19092}
       TOPIC: ${TOPIC:-shop.events}
+      DLQ_TOPIC: ${DLQ_TOPIC:-shop.events.dlq}
       TOPIC_PARTITIONS: ${TOPIC_PARTITIONS:-3}
       TOPIC_RETENTION_MS: ${TOPIC_RETENTION_MS:-86400000}
     volumes:
@@ -175,6 +176,9 @@ services:
       TOPIC: ${TOPIC:-shop.events}
       EVENTS_PER_SECOND: ${EVENTS_PER_SECOND:-5}
       SIM_SEED: ${SIM_SEED:-}
+      BAD_EVENT_RATE: ${BAD_EVENT_RATE:-0.02}
+      LATE_EVENT_RATE: ${LATE_EVENT_RATE:-0.05}
+      LATE_EVENT_LAG_SECONDS: ${LATE_EVENT_LAG_SECONDS:-180}
       CATALOG_PATH: /app/catalog/products.json
     restart: unless-stopped
     mem_limit: 256m
@@ -197,6 +201,10 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:19092}
       TOPIC: ${TOPIC:-shop.events}
+      DLQ_TOPIC: ${DLQ_TOPIC:-shop.events.dlq}
+      WATERMARK_DELAY: "${WATERMARK_DELAY:-1 minute}"
+      GMV_WINDOW: "${GMV_WINDOW:-1 minute}"
+      SESSION_GAP: "${SESSION_GAP:-30 seconds}"
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
       POSTGRES_DB: ${POSTGRES_DB:-shop}
@@ -214,7 +222,7 @@ services:
       - --master
       - local[2]
       - --driver-memory
-      - 768m
+      - 1024m
       - --conf
       - spark.driver.bindAddress=0.0.0.0
       - --conf

@@ -1,43 +1,46 @@
 # shop-stream
 
-本機的電商 event pipeline。一條指令拉起 Kafka（KRaft）、Schema Registry、一支 Python producer、Spark Structured Streaming、PostgreSQL 和 MongoDB。Event 會寫進有型別的 table，也會寫進一份 raw document collection。
+本機的電商 event pipeline。一條指令拉起 Kafka（KRaft）、Schema Registry、一支 Python producer、Spark Structured Streaming、PostgreSQL 和 MongoDB。Event 會 upsert 進有型別的 table，也會寫進一份 raw document collection。
 
-這是 Milestone 1：一條可以直接在筆電上跑、面試時順著講的 ingest path。Watermark、idempotent upsert、session window、dead-letter topic、metrics 和 dbt 都是後面的 milestone。程式裡已經標了它們要接上去的位置。
+Milestone 1 是 ingest path。Milestone 2 加上正確性：event-time watermark、依 natural key 的 idempotent upsert、session window、1 分鐘 tumbling GMV、dead-letter。Prometheus、Grafana、dbt、BigQuery 還在後面。可以在筆電上跑，也可以順著講。
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-  Gen["Event generator<br/>session simulator"]
+  Gen["Event generator<br/>session simulator<br/>bad + late injection"]
   SR["Schema Registry<br/>JSON Schema"]
   Kafka["Kafka KRaft<br/>shop.events<br/>key = user_id<br/>3 partitions"]
-  Spark["Spark Structured Streaming<br/>local mode"]
-  PG[("PostgreSQL<br/>events, orders,<br/>order_items, payments")]
-  Mongo[("MongoDB<br/>events_raw + products")]
+  Spark["Spark Structured Streaming<br/>facts, session window, GMV"]
+  PG[("PostgreSQL<br/>facts + session_metrics<br/>+ gmv_1m")]
+  Mongo[("MongoDB<br/>events_raw + products<br/>+ events_dlq")]
+  DLQ["shop.events.dlq"]
   UI["Kafka UI :8080"]
 
   Gen -->|register shop.events-value| SR
-  Gen -->|"Confluent wire format<br/>magic + schema id + JSON"| Kafka
+  Gen -->|"valid JSON, bad frames, late event_time"| Kafka
   Kafka --> Spark
-  Spark -->|flattened projections| PG
-  Spark -->|full payload| Mongo
+  Spark -->|upsert by natural key| PG
+  Spark -->|raw payload| Mongo
+  Spark -->|invalid records| DLQ
+  DLQ --> Mongo
   Seed["Catalog seed"] -->|heterogeneous attributes| Mongo
   UI --> Kafka
   UI --> SR
 ```
 
-Generator 自己編 `session_id`。Pipeline 目前沒有任何一段在計算 session。這個區別就是重點：這個 id 只是 producer 圖方便，真正的 session window（M2）必須從 `event_time` 推回來。
+Generator 仍會編 `session_id`，那只是 producer 圖方便。Session window 不讀它，而是用 `user_id` 加 `event_time` 的 gap 算出來。
 
 ## 各元件在做什麼
 
 | 元件 | 角色 |
 | --- | --- |
-| Event generator | 走一個很小的 per-user state machine：page view、add to cart、order、payment。把 device 和 UTM 黏在同一個 session 上。先註冊 JSON Schema，再以 key `user_id` produce 到 `shop.events`。速率是 `EVENTS_PER_SECOND`。 |
-| Kafka | 一台 combined KRaft broker。沒有 ZooKeeper。Topic 由 `kafka/create-topics.sh` 建立（3 partitions、RF 1、retention 24 小時）。Auto-create 關掉，避免打錯字多生出一個 1-partition topic。 |
+| Event generator | 走一個很小的 per-user state machine：page view、add to cart、order、payment。把 device 和 UTM 黏在同一個 session 上。先註冊 JSON Schema，再以 key `user_id` produce 到 `shop.events`。速率是 `EVENTS_PER_SECOND`。另外依 `BAD_EVENT_RATE` 塞不合法的 bytes，依 `LATE_EVENT_RATE` 把 `event_time` 往回撥。 |
+| Kafka | 一台 combined KRaft broker。沒有 ZooKeeper。`kafka/create-topics.sh` 建立 `shop.events` 和 `shop.events.dlq`（各 3 partitions、RF 1、retention 24 小時）。Auto-create 關掉，避免打錯字多生出一個 1-partition topic。 |
 | Schema Registry | 把契約放在 subject `shop.events-value`（TopicNameStrategy）。Registry 沒起來，producer 就拒絕啟動，對不上 schema 的 payload 不會進 topic。 |
-| Spark | 從 `earliest` 讀 topic（第一次跑完之後以 checkpoint 為準），剝掉 5-byte 的 Confluent prefix，用一份明確的 struct 解析 JSON，每個 micro-batch 在 `foreachBatch` 裡寫出。Checkpoint 放在 volume。 |
-| PostgreSQL | 有型別的 landing table。每個 event 一列攤平的 row，另外有 orders、order items、payments。初始化 SQL 在 `postgres/init/`。 |
-| MongoDB | `events_raw` 留著巢狀 payload，加上 Kafka offset 和 schema id。`products` 是一份 catalog，`attributes` 物件的形狀依 category 而變。 |
+| Spark | 三條 query，各有自己的 checkpoint。Facts 剝掉 5-byte Confluent prefix、驗證契約、upsert 合法的 row，並把不合法的送去 DLQ。Session 和 GMV 兩條 query 在 `event_time` 上加 watermark，用 update mode 把 window 寫進 Postgres。 |
+| PostgreSQL | 有型別的 fact table（events、orders、order items、payments），加上 `session_metrics` 和 `gmv_1m`。初始化 SQL 在 `postgres/init/`。 |
+| MongoDB | `events_raw` 留著巢狀 payload，以 `event_id` unique upsert。`events_dlq` 以 source offset unique upsert。`products` 是一份 catalog，`attributes` 物件的形狀依 category 而變。 |
 | Kafka UI | 在 `http://localhost:8080` 瀏覽 topic 和已註冊的 schema。不在資料路徑上。 |
 | Spark UI | Query 在跑的時候開 `http://localhost:4040`。 |
 
@@ -55,7 +58,7 @@ make reset   # stop and delete volumes
 
 `docker compose up --build` 做同樣的啟動，只是跑在前景。預設值寫在 `docker-compose.yml`，沒有 `.env` 也沒關係。要改速率、port 或本機資料庫密碼，編輯 `.env`（對照 `.env.example`）。這組密碼只給筆電本機用。
 
-`make check` 只有在 Postgres 已經有 events、orders、payments，而且 Mongo 已經有 raw events 和 products 時才會 exit 0。第一次啟動請多等幾分鐘：Spark 要先起來，然後一個 5 秒的 trigger 才會把 batch 寫下去。
+`make check` 會等到 facts、`session_metrics`、`gmv_1m`、late events 和 Mongo `events_dlq` 都有資料，檢查 natural key 沒有重複，然後停掉 generator、對 Spark 送 `SIGKILL`，再確認那些 count 沒有變。第一次啟動請多等幾分鐘：Spark 要先起來，然後一個 5 秒的 trigger 才會把 batch 寫下去。Check 結束會把 generator 拉回來。
 
 常用的旋鈕：
 
@@ -65,6 +68,12 @@ make reset   # stop and delete volumes
 | `TOPIC_PARTITIONS` | `3` | 只在 topic 建立時生效。改完要 `make reset`。 |
 | `TRIGGER_INTERVAL` | `5 seconds` | Spark micro-batch trigger。 |
 | `SIM_SEED` | 空 | 設一個整數，就可以重放同一段 session 序列。 |
+| `BAD_EVENT_RATE` | `0.02` | 不走 serializer 的壞 record 比例。`0` 就關掉。 |
+| `LATE_EVENT_RATE` | `0.05` | 合法、但 `event_time` 被往回撥的比例。 |
+| `LATE_EVENT_LAG_SECONDS` | `180` | 往回撥幾秒。要大於 watermark，才算 too-late。 |
+| `WATERMARK_DELAY` | `1 minute` | Session 和 GMV query 的允許遲到。 |
+| `GMV_WINDOW` | `1 minute` | GMV tumbling window。 |
+| `SESSION_GAP` | `30 seconds` | 同一個 user 多久沒有 event 就結束一個 session。 |
 
 Host 上的 port：Kafka `9092`、Schema Registry `8081`、Postgres `5432`、Mongo `27017`、Kafka UI `8080`、Spark UI `4040`。
 
@@ -127,7 +136,7 @@ kafka/create-topics.sh      shop.events 的 partition 數和 retention
 postgres/init/01_tables.sql landing table
 catalog/products.json       catalog 的唯一來源
 generator/                  producer、simulator、schema、catalog seed
-spark/job/                  streaming query、parse、sink
+spark/job/                  facts、watermarked session / GMV、upsert、DLQ
 scripts/check.sh            make check 用的驗證
 tests/                      simulator 的不變量，以及 wire-format decoder
 ```
@@ -140,7 +149,7 @@ tests/                      simulator 的不變量，以及 wire-format decoder
 
 Kafka 只保證同一個 partition 裡的順序，預設 partitioner 會對 key 做 hash。用 `user_id` 當 key，同一個 user 的每個 event 都會落在同一個 partition，順序就是 producer 送出的順序。一條 funnel（view，然後 cart，然後 order，然後 payment）不用下游再排序就保持這個順序。
 
-`order_id` 不能當 key。`page_view` 和 `add_to_cart` 發生在 order 存在之前，那些 record 會被 hash 到別的地方（null key 則是 round-robin）。`session_id` 也能讓一次造訪維持順序，但整個系統裡只有 generator 知道它。M2 要從 `event_time` 推出 session，而跨 session 仍然穩定的實體是 user。
+`order_id` 不能當 key。`page_view` 和 `add_to_cart` 發生在 order 存在之前，那些 record 會被 hash 到別的地方（null key 則是 round-robin）。`session_id` 也能讓一次造訪維持順序，但那是 producer 編的。Session window 從 `event_time` 算，不信任這個 id。跨 session 仍然穩定的實體是 user，所以 key 還是 `user_id`。
 
 三個 partition 是本機的折衷。一個 partition 會把這個決定藏起來，因為反正全部都有序。一台 broker 上 partition 再多，只是多一些檔案。Replication factor 是 1，因為只有一台 broker。`acks=all` 配 `min.insync.replicas=1`，是這台 broker 實際上給得了的最強保證。
 
@@ -157,11 +166,11 @@ Postgres 放 dashboard 或 dbt project 會掃描的 row：
 
 欄位有型別（`TIMESTAMPTZ`、`NUMERIC(12,2)`）、有 check（`event_type` enum、`qty > 0`），並依 user + time 建 index。金額寫成兩位小數的 numeric，不是 float column。
 
-這些是 landing table。Primary key 是 surrogate `id`。`event_id` 有 index，但不是 unique。這是刻意的，也就是下面 M1 的 delivery 故事。
+Fact table 的 primary key 仍是 surrogate `id`。`event_id`、`order_id`、`(order_id, sku)`、`payment_id` 另外是 UNIQUE，sink 對它們做 upsert。Aggregate table 沒有 surrogate：`session_metrics` 的 primary key 是 `(user_id, session_start)`，`gmv_1m` 是 `(window_start, currency)`。下面的 delivery 一節說明為什麼這還不叫 exactly-once。
 
 Mongo 放兩種跟固定 table 打架的形狀：
 
-1. Raw event。巢狀的 `payload`、Kafka partition 和 offset、schema id。Projection 寫錯的時候，這份 document 就是拿來回放的來源。契約裡的東西沒有被丟掉。
+1. Raw event。巢狀的 `payload`、Kafka partition 和 offset、schema id。以 `event_id` unique upsert。Projection 寫錯的時候，這份 document 就是拿來回放的來源。契約裡的東西沒有被丟掉。不合法的 record 不進這裡，它們進 `events_dlq`。
 2. Product catalog。Electronics 有電池續航和一個 dimension 物件。Apparel 有 size 陣列和 material。Grocery 有 origin 和保存期限。Beauty 有 shade 和 SPF。一組 nullable column 大部分會是空的。Entity-attribute-value table 又會把 document 藏起來。`attributes` 就維持一個物件。
 
 Event 的 line item 只存 sku、name、category、qty 和 unit price。它不複製 `attributes`。Catalog 是那份非結構化的紀錄；order line 是當時實際計價的快照。
@@ -184,38 +193,50 @@ bytes 5-    UTF-8 JSON
 
 這個 milestone 用 JSON Schema 而不是 Avro：Kafka UI 裡可以直接讀 record，prefix 拿掉之後 `from_json` 就是一般的 PySpark。代價是訊息大小。大小開始有差的時候，再換成 Avro 或 Protobuf。Registry、subject 和那 5-byte prefix 都不用改。
 
-### Delivery semantics，以及 M2 會改什麼
+### Delivery semantics：at-least-once 加上 idempotent sink
 
-從頭到尾是 at-least-once。
+Producer 是 idempotent 的，而且用 `acks=all`，所以 producer 自己的重試不會把同一筆 record append 兩次。
 
-- Producer 是 idempotent 的，而且用 `acks=all`，所以 producer 自己的重試不會重複。
-- Spark Structured Streaming 在 `foreachBatch` 返回之後才 commit checkpoint。Offset 住在 checkpoint volume，不在 Kafka consumer group。Consumer-group lag 描述不了這個 job。M3 應該用 streaming query 的 source metrics，或是刻意去 commit 一個 group id。
-- Process 如果在 Postgres commit 之後、checkpoint 寫入之前死掉，micro-batch 會再跑一次，landing table 就會多一份那些 row。如果死在 commit 之前，batch 只是重試。
+Spark Structured Streaming 在 `foreachBatch` 返回之後才 commit checkpoint。Offset 住在 checkpoint volume，不在 Kafka consumer group。Consumer-group lag 描述不了這個 job。M3 應該用 streaming query 的 source metrics，或是刻意去 commit 一個 group id。
 
-解析不了的 record（錯誤的 magic byte、壞掉的 UTF-8、對不上 struct 的 JSON）會被計數、寫 log，然後丟掉。它們不會送去 dead-letter topic。從 batch 返回，就會把 offset commit 過這些 record。
+Process 如果在 sink commit 之後、checkpoint 寫入之前死掉，micro-batch 會再跑一次。這是 at-least-once。Exactly-once 要的是 offset 和 sink 寫入在同一個 transaction 裡。這裡有 Postgres 和 Mongo 兩個 sink，再加上 Kafka offset，沒有一個 transaction 罩得住三邊，所以不宣稱 exactly-once。
 
-沒有 watermark。`event_time` 有存下來，但沒有用來關閉 window，也沒有用來判斷一筆 event 是不是 late。
+實務上用的是 at-least-once 加 idempotent write。重跑的 batch 打到同一個 natural key，`ON CONFLICT DO UPDATE` 蓋過同一列，row count 不變。效果對那些 key 來說是 effectively-once：GMV 不會因為 Spark 重啟被加兩次。`make check` 會停掉 generator、對 Spark 送 `SIGKILL`，再比對 events、orders、order items、payments、session、GMV 和 Mongo 的 count。
 
-M2 改的是 consumer 這一側，位置已經標在 `spark/job/parse.py` 和 `spark/job/sinks.py`：
+Kafka DLQ 是這個規則的例外。Topic 是 append-only，replay 可能再寫一筆 poison message。Mongo `events_dlq` 用 source topic、partition、offset 當 unique key upsert，所以查得到的那份不會重複。Compacted topic 不適合當錯誤紀錄，compaction 會把 payload 清掉。
 
-- 在 `event_time` 上加 watermark 和 late-data policy
-- 以 `event_id` 做 idempotent write：unique constraint 加上 upsert，重放的 batch 就不會把 GMV 算兩次
-- session window，從 event time 算出來，而不是信任 `session_id`
-- 在 `payments` 上做即時的 GMV query
-- 解析失敗的 record 進 dead-letter topic，再落地到 Mongo
+### Watermark 與 too-late
 
-這些還沒接上之前，不要把 row count 當成 exactly-once 的總數。`make reset` 再跑一次，才是乾淨的量測。
+預設 watermark 是 **1 minute**，GMV 是 **1 minute** tumbling window，session gap 是 **30 seconds**。三個都是 Spark interval，可以用環境變數改。
+
+Generator 的 `event_time` 是 wall-clock UTC。1 分鐘蓋得住筆電上一次 micro-batch 的延遲，又不會把 1 分鐘的 GMV window 開一整天。再短，一次慢 batch 或暫停就會把合法的 payment 從 aggregate 拿掉。再長，state 留更久，demo 也要等更久才看得到 window 被清掉。
+
+Too-late 的定義是：event time 早於這條 query 已經看過的 max event time 減掉 watermark。Session 和 GMV 兩條 query 會丟掉這些 record，也不會重開已經被 watermark 越過的 window。Fact table 不套這個 watermark。晚到的 payment 仍然 upsert 進 `payments` 和 `events`，只是不能再改已經走掉的 GMV window。這是刻意的拆法：事實表要完整，aggregate 要有界。
+
+Spark 的 watermark 是看到資料之後才建立的。頭幾個 micro-batch 還沒有 watermark，所以少數一開始就很舊的 event 仍可能進 window。Watermark 建立之後，規則才生效。`LATE_EVENT_LAG_SECONDS` 預設 180，大於 1 分鐘，用來製造 too-late。`make check` 會確認 `events` 裡看得到這些晚到的 row，同時 `gmv_1m` 也有 window。
+
+Session gap 用 30 秒。預設速率下，同一個 user 在活躍時大約每幾秒被碰到一次，所以 30 秒的安靜代表這次造訪結束。再短會把同一次逛店切開。再長的話，append mode 要等更久才吐出列（還要再加 watermark）。這條 window 不讀 `session_id`。Fact row 上仍留著 producer 的 `session_id`，面試時可以拿來對照：producer 編的 id 和 engine 算的 window 回答的是不同問題。
+
+Spark 的 session window 不支援 update mode，所以這條 query 用 append：watermark 越過 session end 才寫出一列。以 30 秒 gap 加 1 分鐘 watermark，大約是最後一個 event 之後 90 秒。GMV 的 tumbling window 支援 update mode，進行中的那一分鐘每個 trigger 都會重寫，sink 再 upsert。Watermark 兩邊都負責丟掉 too-late，也負責把過期的 state 清掉。
+
+### Dead-letter
+
+不進 fact table 的只有三種：`invalid_frame`（沒有 Confluent magic byte 或 prefix 被截斷）、`unparseable`（prefix 後面不是 JSON）、`schema_violation`（JSON 在，但對不上契約，例如 `event_type` 不在 enum 裡）。Late data 不是其中一種。
+
+`BAD_EVENT_RATE` 讓 generator 繞過 serializer，直接送這三種 bytes。Serializer 自己會擋掉不合法的 document，如果壞資料也走它，DLQ 永遠是空的。
+
+DLQ topic 是 `shop.events.dlq`。Value 是我們組的 JSON，帶 `error_reason` 和 `error_class`，不註冊進 Schema Registry。Poison payload 不該再被契約擋一次。Key 沿用原本的 message key；注入的壞 record 用 key `bad`，因為它們沒有 `user_id`。Topic 不 compact。
 
 ### 為什麼用 foreachBatch
 
-Kafka 的讀取和 JSON 的解析留在 streaming plan 裡，Spark UI 上應該看得到這一段。寫出是一個看得到整份 micro-batch 的 function。Upsert、dead-letter 的拆分，以及「Postgres 然後 Mongo，否則兩邊都不算」的決定，都該放在這個 function。一秒幾個 event 的時候，在 driver 上 `collect` 整份 batch 沒問題，`maxOffsetsPerTrigger`（500）也把它卡住。這不是 production 量級該有的形狀。接點本身不變：load test 說要換的時候，把 `collect` 換成每個 partition 一次 JDBC write。
+Kafka 的讀取、JSON parse 和 window aggregation 留在 streaming plan 裡，Spark UI 上應該看得到。寫出是一個看得到整份 micro-batch 的 function，upsert 和 DLQ 分流都在這裡。一秒幾個 event 的時候，在 driver 上 `collect` 整份 batch 沒問題，`maxOffsetsPerTrigger`（500）也把它卡住。這不是 production 量級該有的形狀。接點本身不變：load test 說要換的時候，把 `collect` 換成每個 partition 一次 JDBC write。
 
 ### 筆電的資源上限
 
-`docker-compose.yml` 裡的大致上限：Kafka heap 384 MB（container 1 GB）、Schema Registry heap 320 MB（container 768 MB）、Spark driver 768 MB（container 2 GB）、Mongo WiredTiger cache 0.25 GB、Kafka UI heap 256 MB。Postgres shared buffers 是 64 MB。整組 stack 大約落在 4 GB。Kafka 的 data retention 是 24 小時。Container log 以 10 MB × 3 輪替。
+`docker-compose.yml` 裡的大致上限：Kafka heap 384 MB（container 1 GB）、Schema Registry heap 320 MB（container 768 MB）、Spark driver 1 GB（container 2 GB）、Mongo WiredTiger cache 0.25 GB、Kafka UI heap 256 MB。Postgres shared buffers 是 64 MB。整組 stack 大約落在 4 GB。Kafka 的 data retention 是 24 小時。Container log 以 10 MB × 3 輪替。
 
 Spark 在一個 container 裡跑 `local[2]`。沒有 cluster，也沒有 Kubernetes。
 
-## 這個 milestone 不做的事
+## 還沒做的事
 
-Watermark、late data、`dropDuplicates`、unique `event_id`、session window、把 GMV 做成 streaming aggregation、dead-letter topic、Prometheus、Grafana、dbt、load test、BigQuery。Landing table 的註解，以及 `parse.py` 和 `sinks.py` 裡的註記，寫的就是哪一個 function 要改。
+Prometheus、Grafana、dbt、load test、BigQuery。沒有 Kubernetes。

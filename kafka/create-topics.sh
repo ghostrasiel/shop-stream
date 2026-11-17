@@ -6,6 +6,7 @@ set -euo pipefail
 
 bootstrap="${KAFKA_BOOTSTRAP_SERVERS:-kafka:19092}"
 topic="${TOPIC:-shop.events}"
+dlq_topic="${DLQ_TOPIC:-shop.events.dlq}"
 partitions="${TOPIC_PARTITIONS:-3}"
 retention_ms="${TOPIC_RETENTION_MS:-86400000}"
 
@@ -24,14 +25,21 @@ if [[ "${ready}" -ne 1 ]]; then
   exit 1
 fi
 
-/opt/kafka/bin/kafka-topics.sh \
-  --bootstrap-server "${bootstrap}" \
-  --create --if-not-exists \
-  --topic "${topic}" \
-  --partitions "${partitions}" \
-  --replication-factor 1 \
-  --config "retention.ms=${retention_ms}" \
-  --config cleanup.policy=delete
+create_topic() {
+  /opt/kafka/bin/kafka-topics.sh \
+    --bootstrap-server "${bootstrap}" \
+    --create --if-not-exists \
+    --topic "$1" \
+    --partitions "${partitions}" \
+    --replication-factor 1 \
+    --config "retention.ms=${retention_ms}" \
+    --config cleanup.policy=delete
+  /opt/kafka/bin/kafka-topics.sh --bootstrap-server "${bootstrap}" --describe --topic "$1"
+}
 
 echo "topic ready:"
-/opt/kafka/bin/kafka-topics.sh --bootstrap-server "${bootstrap}" --describe --topic "${topic}"
+create_topic "${topic}"
+# DLQ is append-only JSON, not Schema Registry encoded, and not compacted:
+# compaction would drop the poison payload. Mongo events_dlq is the deduped copy.
+echo "dlq topic ready:"
+create_topic "${dlq_topic}"

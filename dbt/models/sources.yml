@@ -1,0 +1,27 @@
+version: 2
+
+sources:
+  - name: shop
+    schema: public
+    description: Postgres landing tables written by Spark.
+    tables:
+      - name: events
+        loaded_at_field: ingested_at
+        freshness:
+          warn_after: {count: 10, period: minute}
+          error_after: {count: 30, period: minute}
+      - name: orders
+        loaded_at_field: ingested_at
+        freshness:
+          warn_after: {count: 10, period: minute}
+          error_after: {count: 30, period: minute}
+      - name: payments
+        loaded_at_field: ingested_at
+        freshness:
+          warn_after: {count: 10, period: minute}
+          error_after: {count: 30, period: minute}
+        description: Includes late payments. This is the batch source of truth for GMV.
+      - name: order_items
+      - name: gmv_1m
+        description: Streaming 1-minute GMV. Payments dropped by the watermark are absent.
+      - name: session_metrics

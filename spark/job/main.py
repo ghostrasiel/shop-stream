@@ -8,12 +8,15 @@ a Kafka consumer group.
 
 from __future__ import annotations
 
+import os
 import sys
 
 from pyspark.sql import SparkSession
 
 from aggregates import gmv_aggregation, session_aggregation
 from config import Config
+from listener import ShopStreamListener
+from metrics_server import METRICS, start_metrics_server
 from parse import parse_stream
 from sinks import wait_for_sinks, write_batch, write_gmv, write_sessions
 
@@ -54,8 +57,16 @@ def main() -> None:
         "[shop-stream] too-late events stay in the fact tables and are dropped from session and GMV windows",
         flush=True,
     )
+    METRICS.help("shop_spark_input_rows_per_second", "Rows per second arriving at the query.")
+    METRICS.help("shop_spark_processed_rows_per_second", "Rows per second the trigger finished.")
+    METRICS.help("shop_spark_batch_duration_ms", "triggerExecution duration of the last micro-batch.")
+    METRICS.help("shop_spark_watermark_dropped_total", "Late rows dropped from window state.")
+    METRICS.help("shop_spark_state_rows", "Rows currently held in streaming state.")
+    METRICS.help("shop_dlq_events_total", "Invalid records written to the DLQ.")
+    start_metrics_server(int(os.environ.get("METRICS_PORT", "9095")))
     wait_for_sinks(cfg)
     spark = build_spark()
+    spark.streams.addListener(ShopStreamListener())
 
     facts = parse_stream(read_kafka(spark, cfg))
     sessions = session_aggregation(parse_stream(read_kafka(spark, cfg)), cfg)

@@ -1,0 +1,77 @@
+version: 2
+
+models:
+  - name: stg_events
+    columns:
+      - name: event_id
+        tests: [unique, not_null]
+      - name: event_type
+        tests:
+          - not_null
+          - accepted_values:
+              values: ["page_view", "add_to_cart", "order_created", "payment_completed"]
+      - name: user_id
+        tests: [not_null]
+  - name: stg_orders
+    columns:
+      - name: order_id
+        tests: [unique, not_null]
+      - name: user_id
+        tests: [not_null]
+      - name: currency
+        tests:
+          - accepted_values:
+              values: ["USD"]
+  - name: stg_order_items
+    columns:
+      - name: order_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_orders')
+              field: order_id
+      - name: sku
+        tests: [not_null]
+  - name: stg_payments
+    columns:
+      - name: payment_id
+        tests: [unique, not_null]
+      - name: order_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_orders')
+              field: order_id
+      - name: amount
+        tests: [not_null]
+  - name: fct_orders
+    columns:
+      - name: order_id
+        tests: [unique, not_null]
+  - name: fct_gmv_1m
+    tests:
+      - unique:
+          column_name: "(window_start::text || currency)"
+    columns:
+      - name: window_start
+        tests: [not_null]
+      - name: gmv
+        tests: [not_null]
+  - name: fct_gmv_daily
+    columns:
+      - name: day
+        tests: [not_null]
+      - name: gmv
+        tests: [not_null]
+  - name: fct_funnel_daily
+    columns:
+      - name: day
+        tests: [unique, not_null]
+  - name: recon_gmv_1m
+    columns:
+      - name: window_start
+        tests: [not_null]
+      - name: gmv_diff
+        tests: [not_null]
+      - name: late_gmv
+        tests: [not_null]

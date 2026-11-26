@@ -22,6 +22,7 @@ from confluent_kafka.serialization import MessageField, SerializationContext
 
 from catalog_data import load_catalog
 from faults import BAD_KINDS, bad_event_bytes, late_event_time, with_event_time
+from metrics_http import METRICS, start_metrics_server
 from simulator import ShopSimulator
 
 log = logging.getLogger("generator")
@@ -148,6 +149,8 @@ def main() -> None:
     interval = 1.0 / rate
     next_at = time.monotonic()
     last_report = time.monotonic()
+    METRICS.help("shop_generator_events_total", "Records the generator handed to Kafka.")
+    start_metrics_server(int(os.environ.get("METRICS_PORT", "9096")))
     log.info(
         "producing topic=%s key=user_id rate=%s/s schema_id=%s bad_rate=%s late_rate=%s late_lag_s=%s",
         topic,
@@ -167,17 +170,21 @@ def main() -> None:
             headers = [("fault", kind.encode("utf-8"))]
             event_type_name = "invalid"
             bad_produced += 1
+            METRICS.inc("shop_generator_events_total", kind="bad", event_type=kind)
         else:
             event = simulator.next_event()
             if roll < bad_rate + late_rate:
                 event = with_event_time(event, late_event_time(datetime.now(timezone.utc), late_lag))
                 late_produced += 1
                 headers = [("event_type", event["event_type"].encode("utf-8")), ("fault", b"late")]
+                metric_kind = "late"
             else:
                 headers = [("event_type", event["event_type"].encode("utf-8"))]
+                metric_kind = "on_time"
             payload = serializer(event, context)
             key = event["user_id"].encode("utf-8")
             event_type_name = event["event_type"]
+            METRICS.inc("shop_generator_events_total", kind=metric_kind, event_type=event_type_name)
         while not stop:
             try:
                 producer.produce(

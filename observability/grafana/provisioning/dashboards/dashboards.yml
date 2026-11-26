@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: shop-stream
+    orgId: 1
+    folder: Shop Stream
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
